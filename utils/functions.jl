@@ -44,49 +44,66 @@ function process_user_files(
     map_to_rename_user_columns::Dict = Dict(),
     number_of_rep_periods::Int = 1,
 )
-    columns = [name for (name, _) in schema]
-    df = DataFrame(Dict(name => Vector{Any}() for name in columns))
+    con = DBInterface.connect(DuckDB.DB)
 
-    files = filter(
-        file ->
-            startswith(file, starting_name_in_files) && endswith(file, ending_name_in_files),
-        readdir(input_folder),
-    )
+    tbl_name = "my_tbl"
+    columns = [Symbol(name) for (name, _) in schema]
 
-    for file in files
-        _df = CSV.read(joinpath(@__DIR__, input_folder, file), DataFrame; header = 2)
-        for (key, value) in map_to_rename_user_columns
-            if key in names(_df)
-                _df = rename!(_df, key => value)
-            end
-        end
-        for column in columns
-            if String(column) ∉ names(_df)
-                _df[!, column] .= missing
-            end
-        end
-        _df = select(_df, columns)
-        df = vcat(df, _df; cols = :union)
-    end
-
-    for (key, value) in default_values
-        if key in names(df)
-            df[!, key] = coalesce.(df[!, key], value)
+    file_glob = "$(starting_name_in_files)*$(ending_name_in_files)"
+    path_glob = joinpath(input_folder, file_glob)
+    try
+        TulipaIO.create_tbl(con, path_glob; name = tbl_name, union_by_name = true, skip = 1)
+    catch err
+        if isa(err, TulipaIO.FileNotFoundError)
+            @warn "Returning empty DataFrame" err
+            create_table_query =
+                "CREATE TABLE $tbl_name (" *
+                join(["$name $type" for (name, type) in schema], ", ") *
+                ")"
+            DBInterface.execute(con, create_table_query)
+            DBInterface.execute(con, "COPY $tbl_name TO '$output_file' (FORMAT csv, HEADER)")
+            return DBInterface.execute(con, "SELECT * FROM $tbl_name") |> DataFrame
         end
     end
 
-    df = select(df, columns)
+    TulipaIO.rename_cols(con, tbl_name; map_to_rename_user_columns...)
+
+    _cnames = map(Symbol, TulipaIO.tbl_cols(con, tbl_name).column_name)
+    for col in setdiff(_cnames, columns)
+        DBInterface.execute(con, "ALTER TABLE $tbl_name DROP $col")
+    end
+
+    _cnames = map(Symbol, TulipaIO.tbl_cols(con, tbl_name).column_name)
+    for (key, value) in filter(p -> (p.first in _cnames) && (p.second != "NULL"), default_values)
+        TulipaIO.update_tbl(con, tbl_name, Dict(key => value); where_ = "$key IS NULL")
+    end
 
     if number_of_rep_periods > 1
-        _df = copy(df)
-        for rp in 2:number_of_rep_periods
-            _df.rep_period .= rp
-            df = vcat(df, _df; cols = :union)
+        tbl_copy = "$(tbl_name)_consolidated"
+        DBInterface.execute(con, "CREATE TABLE $tbl_copy AS SELECT * FROM $tbl_name LIMIT 0")
+        DBInterface.execute(con, "ALTER TABLE $tbl_copy ADD COLUMN rep_period INTEGER")
+        for rp in 1:number_of_rep_periods
+            DBInterface.execute(con, "INSERT INTO $tbl_copy SELECT *, $rp FROM $tbl_name")
         end
+        tbl_name = tbl_copy
     end
 
-    CSV.write(output_file, df; append = true, writeheader = true)
-    return df
+    _cnames = map(Symbol, TulipaIO.tbl_cols(con, tbl_name).column_name)
+    missing_columns_from_schema = setdiff(columns, _cnames)
+
+    if !isempty(missing_columns_from_schema)
+        for name in missing_columns_from_schema
+            DBInterface.execute(
+                con,
+                "ALTER TABLE $(tbl_name) ADD COLUMN \"$name\" $(schema[string(name)]) DEFAULT $(default_values[name]) ;",
+            )
+        end
+        DBInterface.execute(con, "COPY $tbl_name TO '$output_file' (FORMAT csv, HEADER)")
+        return DBInterface.execute(con, "SELECT * FROM $tbl_name") |> DataFrame
+    end
+
+    DBInterface.execute(con, "COPY $tbl_name TO '$output_file' (FORMAT csv, HEADER)")
+    return DBInterface.execute(con, "SELECT * FROM $tbl_name") |> DataFrame
 end
 
 """
@@ -127,7 +144,7 @@ function process_flows_rep_period_partition_file(
     default_values::Dict;
     number_of_rep_periods::Int = 1,
 )
-    columns = [name for (name, _) in schema]
+    columns = [Symbol(name) for (name, _) in schema]
     df = DataFrame(Dict(name => Vector{Any}() for name in columns))
 
     df_assets_partition = CSV.read(assets_partition_file, DataFrame)
@@ -136,7 +153,7 @@ function process_flows_rep_period_partition_file(
     df = vcat(df, df_flows; cols = :union)
 
     for (key, value) in default_values
-        if key in names(df)
+        if key in propertynames(df)
             df[!, key] = coalesce.(df[!, key], value)
         end
     end
@@ -188,7 +205,7 @@ Create a single file containing basic information about assets.
 # Description
 This function processes user input files located in `user_input_dir`, applies a predefined schema,
 and saves the resulting data to a file named `file_name` in the `output_dir`.
-The schema includes columns for name, type, bidding_zone, technology, latitude, and longitude.
+The schema includes columns for name, type, asset, technology, latitude, and longitude.
 Default values for missing data are provided by the `default_values` dictionary.
 
 """
@@ -196,15 +213,14 @@ function create_one_file_for_assets_basic_info(
     file_name::String,
     user_input_dir::String,
     output_dir::String,
-    default_values::Dict{String,Any},
+    default_values::Dict{Symbol,Any},
 )
     schema = (
-        :name => "VARCHAR",
-        :type => "VARCHAR",
-        :bidding_zone => "VARCHAR",
-        :technology => "VARCHAR",
-        :lat => "DOUBLE",
-        :lon => "DOUBLE",
+        "asset" => "VARCHAR",
+        "type" => "VARCHAR",
+        "technology" => "VARCHAR",
+        "lat" => "DOUBLE",
+        "lon" => "DOUBLE",
     )
     df = process_user_files(
         user_input_dir,
@@ -212,7 +228,8 @@ function create_one_file_for_assets_basic_info(
         schema,
         "assets",
         "basic-data.csv",
-        default_values,
+        default_values;
+        map_to_rename_user_columns = Dict(:name => "asset"),
     )
     return df
 end
@@ -223,11 +240,11 @@ function create_timeframe_partition_file(
     schema::Union{NTuple,OrderedDict},
     default_values::Dict,
 )
-    columns = [name for (name, _) in schema]
+    columns = [Symbol(name) for (name, _) in schema]
     df = DataFrame(Dict(name => Vector{Any}() for name in columns))
     df = vcat(df, seasonal_assets; cols = :union)
     for (key, value) in default_values
-        if key in names(df)
+        if key in propertynames(df)
             df[!, key] = coalesce.(df[!, key], value)
         end
     end
@@ -240,66 +257,65 @@ end
 
 function get_default_values(; default_year::Int = 2050)
     return Dict(
-        "active" => true,
-        "capacity" => 0.0,
-        "capacity_storage_energy" => 0.0,
-        "carrier" => "electricity",
-        "milestone_year" => default_year,
-        "commission_year" => default_year,
-        "consumer_balance_sense" => missing,
-        "decommissionable" => false,
-        "discount_rate" => 0.0,
-        "economic_lifetime" => 1.0,
-        "efficiency" => 1.0,
-        "energy_to_power_ratio" => 0,
-        "fixed_cost" => 0.0,
-        "fixed_cost_storage_energy" => 0.0,
-        "group" => missing,
-        "initial_export_units" => 0.0,
-        "initial_import_units" => 0.0,
-        "initial_storage_level" => missing,
-        "initial_storage_units" => 0,
-        "initial_units" => 0,
-        "investment_cost" => 0.0,
-        "investment_cost_storage_energy" => 0.0,
-        "investment_integer" => false,
-        "investment_integer_storage_energy" => false,
-        "investment_limit" => missing,
-        "investment_limit_storage_energy" => missing,
-        "investment_method" => "none",
-        "investable" => false,
-        "is_milestone" => true,
-        "is_seasonal" => false,
-        "is_transport" => false,
-        "max_energy_timeframe_partition" => missing,
-        "max_ramp_down" => missing,
-        "max_ramp_up" => missing,
-        "min_energy_timeframe_partition" => missing,
-        "min_operating_point" => 0.0,
-        "num_timesteps" => 8760,
-        "partition" => 1,
-        "peak_demand" => 0,
-        "period" => 1,
-        "rep_period" => 1,
-        "resolution" => 1.0,
-        "ramping" => false,
-        "specification" => "uniform",
-        "storage_inflows" => 0,
-        "storage_method_energy" => false,
-        "technical_lifetime" => 1.0,
-        "unit_commitment" => false,
-        "unit_commitment_integer" => false,
-        "unit_commitment_method" => missing,
-        "units_on_cost" => 0.0,
-        "use_binary_storage_method" => missing,
-        "variable_cost" => 0.0,
-        "weight" => 1.0,
-        "year" => default_year,
-        "bidding_zone" => missing,
-        "technology" => missing,
-        "lat" => 0,
-        "lon" => 0,
-        "length" => 8760,
+        :active => true,
+        :capacity => 0.0,
+        :capacity_storage_energy => 0.0,
+        :carrier => "electricity",
+        :milestone_year => default_year,
+        :commission_year => default_year,
+        :consumer_balance_sense => "NULL",
+        :decommissionable => false,
+        :discount_rate => 0.0,
+        :economic_lifetime => 1.0,
+        :efficiency => 1.0,
+        :energy_to_power_ratio => 0,
+        :fixed_cost => 0.0,
+        :fixed_cost_storage_energy => 0.0,
+        :group => "NULL",
+        :initial_export_units => 0.0,
+        :initial_import_units => 0.0,
+        :initial_storage_level => "NULL",
+        :initial_storage_units => 0,
+        :initial_units => 0,
+        :investment_cost => 0.0,
+        :investment_cost_storage_energy => 0.0,
+        :investment_integer => false,
+        :investment_integer_storage_energy => false,
+        :investment_limit => "NULL",
+        :investment_limit_storage_energy => "NULL",
+        :investment_method => "'none'",
+        :investable => false,
+        :is_milestone => true,
+        :is_seasonal => false,
+        :is_transport => false,
+        :max_energy_timeframe_partition => "NULL",
+        :max_ramp_down => "NULL",
+        :max_ramp_up => "NULL",
+        :min_energy_timeframe_partition => "NULL",
+        :min_operating_point => 0.0,
+        :num_timesteps => 8760,
+        :partition => 1,
+        :peak_demand => 0,
+        :period => 1,
+        :rep_period => 1,
+        :resolution => 1.0,
+        :ramping => false,
+        :specification => "'uniform'",
+        :storage_inflows => 0,
+        :storage_method_energy => false,
+        :technical_lifetime => 1.0,
+        :unit_commitment => false,
+        :unit_commitment_integer => false,
+        :unit_commitment_method => "NULL",
+        :units_on_cost => 0.0,
+        :use_binary_storage_method => "NULL",
+        :variable_cost => 0.0,
+        :weight => 1.0,
+        :year => default_year,
+        :technology => "NULL",
+        :lat => 0,
+        :lon => 0,
+        :length => 8760,
     )
 end
 
@@ -426,7 +442,7 @@ function get_intra_storage_levels_dataframe(connection)
 end
 
 """
-    get_balance_per_bidding_zone(energy_problem::EnergyProblem, assets::DataFrame) -> DataFrame
+    get_balance_per_asset(energy_problem::EnergyProblem, assets::DataFrame) -> DataFrame
 
 Calculate the energy balance per bidding zone based on the given energy problem and assets data.
 
@@ -437,7 +453,7 @@ Calculate the energy balance per bidding zone based on the given energy problem 
 
 # Returns
 - `DataFrame`: A DataFrame containing the energy balance per bidding zone with columns:
-    - `bidding_zone`: The bidding zone name.
+    - `asset`: The asset name.
     - `technology`: The technology type.
     - `year`: The year.
     - `rep_period`: The representative period.
@@ -445,7 +461,7 @@ Calculate the energy balance per bidding zone based on the given energy problem 
     - `solution`: The calculated balance value.
 
 """
-function get_balance_per_bidding_zone(connection, energy_problem::EnergyProblem, assets::DataFrame)
+function get_balance_per_asset(connection, energy_problem::EnergyProblem, assets::DataFrame)
     # Get the flows dataframe
     df = TulipaIO.get_table(connection, "var_flow")
 
@@ -455,18 +471,12 @@ function get_balance_per_bidding_zone(connection, energy_problem::EnergyProblem,
     # Merge df with df_assets
     df_assets_from = rename(
         _assets,
-        Dict(
-            :type => :type_from,
-            :bidding_zone => :bidding_zone_from,
-            :technology => :technology_from,
-        ),
+        Dict(:type => :type_from, :asset => :asset_from, :technology => :technology_from),
     )
-    leftjoin!(df, df_assets_from; on = :from => :name)
-    df_assets_to = rename(
-        _assets,
-        Dict(:type => :type_to, :bidding_zone => :bidding_zone_to, :technology => :technology_to),
-    )
-    leftjoin!(df, df_assets_to; on = :to => :name)
+    leftjoin!(df, df_assets_from; on = :from_asset => :asset_from)
+    df_assets_to =
+        rename(_assets, Dict(:type => :type_to, :asset => :asset_to, :technology => :technology_to))
+    leftjoin!(df, df_assets_to; on = :to_asset => :asset_to)
 
     # Filter and create new columns in the df 
     # note: we only get the flows that are going to or coming from hubs and consumers
@@ -476,94 +486,94 @@ function get_balance_per_bidding_zone(connection, energy_problem::EnergyProblem,
         df,
     )
     df[!, :duration] = df[!, :time_block_end] .- df[!, :time_block_start] .+ 1
-    df = unroll_dataframe(df, [:from, :to, :year, :rep_period])
+    df = unroll_dataframe(df, [:from_asset, :to_asset, :year, :rep_period])
 
     # Get producers into the balance
     _df = filter(row -> row.type_from == "producer" && row.type_to in ["hub", "consumer"], df)
-    gdf = groupby(_df, [:to, :technology_from, :year, :rep_period, :time])
+    gdf = groupby(_df, [:to_asset, :technology_from, :year, :rep_period, :time])
     df_producer = combine(gdf) do sdf
         DataFrame(; solution = sum(sdf.solution))
     end
-    rename!(df_producer, [:to => :bidding_zone, :technology_from => :technology])
+    rename!(df_producer, [:to_asset => :asset, :technology_from => :technology])
 
     # Get storage discharge
     _df = filter(row -> row.type_from == "storage" && row.type_to in ["hub", "consumer"], df)
-    gdf = groupby(_df, [:to, :technology_from, :year, :rep_period, :time])
+    gdf = groupby(_df, [:to_asset, :technology_from, :year, :rep_period, :time])
     df_storage_discharge = combine(gdf) do sdf
         DataFrame(; solution = sum(sdf.solution))
     end
-    rename!(df_storage_discharge, [:to => :bidding_zone, :technology_from => :technology])
+    rename!(df_storage_discharge, [:to_asset => :asset, :technology_from => :technology])
     df_storage_discharge.technology = string.(df_storage_discharge.technology, "_discharge")
 
     # Get storage charge
     _df = filter(row -> row.type_to == "storage" && row.type_from in ["hub", "consumer"], df)
-    gdf = groupby(_df, [:from, :technology_to, :year, :rep_period, :time])
+    gdf = groupby(_df, [:from_asset, :technology_to, :year, :rep_period, :time])
     df_storage_charge = combine(gdf) do sdf
         DataFrame(; solution = sum(sdf.solution))
     end
-    rename!(df_storage_charge, [:from => :bidding_zone, :technology_to => :technology])
+    rename!(df_storage_charge, [:from_asset => :asset, :technology_to => :technology])
     df_storage_charge.technology = string.(df_storage_charge.technology, "_charge")
     df_storage_charge.solution = -df_storage_charge.solution
 
     # Get conversion production
     _df = filter(row -> row.type_from == "conversion" && row.type_to in ["hub", "consumer"], df)
-    gdf = groupby(_df, [:to, :technology_from, :year, :rep_period, :time])
+    gdf = groupby(_df, [:to_asset, :technology_from, :year, :rep_period, :time])
     df_conversion_production = combine(gdf) do sdf
         DataFrame(; solution = sum(sdf.solution))
     end
-    rename!(df_conversion_production, [:to => :bidding_zone, :technology_from => :technology])
+    rename!(df_conversion_production, [:to_asset => :asset, :technology_from => :technology])
 
     # get conversion consumption
     _df = filter(row -> row.type_to == "conversion" && row.type_from in ["hub", "consumer"], df)
-    gdf = groupby(_df, [:from, :technology_to, :year, :rep_period, :time])
+    gdf = groupby(_df, [:from_asset, :technology_to, :year, :rep_period, :time])
     df_conversion_consumption = combine(gdf) do sdf
         DataFrame(; solution = sum(sdf.solution))
     end
-    rename!(df_conversion_consumption, [:from => :bidding_zone, :technology_to => :technology])
+    rename!(df_conversion_consumption, [:from_asset => :asset, :technology_to => :technology])
     df_conversion_consumption.solution = -df_conversion_consumption.solution
 
     # get outgoing/incoming to hubs from hubs and consumers
     _df = filter(row -> row.type_to == "hub" && row.type_from in ["hub", "consumer"], df)
-    gdf = groupby(_df, [:from, :technology_to, :year, :rep_period, :time])
+    gdf = groupby(_df, [:from_asset, :technology_to, :year, :rep_period, :time])
     df_outgoing_to_hubs = combine(gdf) do sdf
         DataFrame(; solution = sum(sdf.solution))
     end
-    rename!(df_outgoing_to_hubs, [:from => :bidding_zone, :technology_to => :technology])
+    rename!(df_outgoing_to_hubs, [:from_asset => :asset, :technology_to => :technology])
     df_outgoing_to_hubs.technology .= "OutgoingFlowToHub"
     df_outgoing_to_hubs.solution = -df_outgoing_to_hubs.solution
 
-    gdf = groupby(_df, [:to, :technology_from, :year, :rep_period, :time])
+    gdf = groupby(_df, [:to_asset, :technology_from, :year, :rep_period, :time])
     df_incoming_from_hubs = combine(gdf) do sdf
         DataFrame(; solution = sum(sdf.solution))
     end
-    rename!(df_incoming_from_hubs, [:to => :bidding_zone, :technology_from => :technology])
+    rename!(df_incoming_from_hubs, [:to_asset => :asset, :technology_from => :technology])
     df_incoming_from_hubs.technology .= "IncomingFlowToHub"
 
     # get outgoing/incoming to consumers from hubs and consumers
     _df = filter(row -> row.type_to == "consumer" && row.type_from in ["hub", "consumer"], df)
-    gdf = groupby(_df, [:from, :technology_to, :year, :rep_period, :time])
+    gdf = groupby(_df, [:from_asset, :technology_to, :year, :rep_period, :time])
     df_outgoing_to_consumers = combine(gdf) do sdf
         DataFrame(; solution = sum(sdf.solution))
     end
-    rename!(df_outgoing_to_consumers, [:from => :bidding_zone, :technology_to => :technology])
+    rename!(df_outgoing_to_consumers, [:from_asset => :asset, :technology_to => :technology])
     df_outgoing_to_consumers.technology .= "OutgoingFlowToConsumer"
     df_outgoing_to_consumers.solution = -df_outgoing_to_consumers.solution
 
-    gdf = groupby(_df, [:to, :technology_from, :year, :rep_period, :time])
+    gdf = groupby(_df, [:to_asset, :technology_from, :year, :rep_period, :time])
     df_incoming_from_consumers = combine(gdf) do sdf
         DataFrame(; solution = sum(sdf.solution))
     end
-    rename!(df_incoming_from_consumers, [:to => :bidding_zone, :technology_from => :technology])
+    rename!(df_incoming_from_consumers, [:to_asset => :asset, :technology_from => :technology])
     df_incoming_from_consumers.technology .= "IncomingFlowToConsumer"
 
     # Get demand of the consumers
     df_demand = TulipaIO.get_table(connection, "cons_balance_consumer")
     df_demand[!, :solution] = value.(energy_problem.model[:balance_consumer])
-    df_demand = leftjoin!(df_demand, _assets; on = :asset => :name)
+    df_demand = leftjoin!(df_demand, _assets; on = :asset => :asset)
     df_demand[!, :duration] = df_demand[!, :time_block_end] .- df_demand[!, :time_block_start] .+ 1
     df_demand = unroll_dataframe(df_demand, [:asset, :year, :rep_period])
     df_demand = select(df_demand, [:asset, :technology, :year, :rep_period, :time, :solution])
-    rename!(df_demand, [:asset => :bidding_zone])
+    rename!(df_demand, [:asset => :asset])
 
     df_balance = vcat(
         df_producer,
@@ -578,8 +588,7 @@ function get_balance_per_bidding_zone(connection, energy_problem::EnergyProblem,
         df_demand,
     )
 
-    df_balance =
-        select(df_balance, [:bidding_zone, :technology, :year, :rep_period, :time, :solution])
+    df_balance = select(df_balance, [:asset, :technology, :year, :rep_period, :time, :solution])
 
     return df_balance
 end
@@ -802,18 +811,14 @@ function plot_inter_storage_levels(connection; assets = [], plots_args = Dict())
     return p
 end
 
-function plot_bidding_zone_balance(
+function plot_asset_balance(
     df::DataFrame;
-    bidding_zone::String,
+    asset::String,
     year::Int,
     rep_period::Int,
     plots_args = Dict(),
 )
-    df = filter(
-        row ->
-            row.bidding_zone == bidding_zone && row.year == year && row.rep_period == rep_period,
-        df,
-    )
+    df = filter(row -> row.asset == asset && row.year == year && row.rep_period == rep_period, df)
     technologies = unique(df.technology)
     technologies = push!(technologies, "NetExchangeWithHubs")
     technologies = push!(technologies, "NetExchangeWithConsumers")
@@ -887,15 +892,15 @@ function plot_flow(
     # filtering the flows
     _df = filter(
         row ->
-            row.from == from_asset &&
-                row.to == to_asset &&
+            row.from_asset == from_asset &&
+                row.to_asset == to_asset &&
                 row.year == year &&
                 row.rep_period == rep_period,
         _df,
     )
 
     _df[!, :duration] = _df[!, :time_block_end] .- _df[!, :time_block_start] .+ 1
-    _df = unroll_dataframe(_df, [:from, :to, :year, :rep_period])
+    _df = unroll_dataframe(_df, [:from_asset, :to_asset, :year, :rep_period])
 
     # group by representative period
     grouped_df = groupby(_df, [:rep_period])
@@ -909,7 +914,7 @@ function plot_flow(
             p[i],
             group[!, :time],
             group[!, :solution] / 1000;
-            group = (group[!, :from], group[!, :to]),
+            group = (group[!, :from_asset], group[!, :to_asset]),
             label = string(from_asset, " -> ", to_asset),
             xlabel = "Hour",
             ylabel = "[GWh]",
