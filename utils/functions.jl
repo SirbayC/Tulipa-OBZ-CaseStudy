@@ -57,7 +57,7 @@ function process_user_files(
         if isa(err, TulipaIO.FileNotFoundError)
             @warn "Returning empty DataFrame" err
             create_table_query =
-                "CREATE TABLE $tbl_name (" *
+                "CREATE OR REPLACE TABLE $tbl_name (" *
                 join(["$name $type" for (name, type) in schema], ", ") *
                 ")"
             DBInterface.execute(con, create_table_query)
@@ -80,7 +80,10 @@ function process_user_files(
 
     if number_of_rep_periods > 1
         tbl_copy = "$(tbl_name)_consolidated"
-        DBInterface.execute(con, "CREATE TABLE $tbl_copy AS SELECT * FROM $tbl_name LIMIT 0")
+        DBInterface.execute(
+            con,
+            "CREATE OR REPLACE TABLE $tbl_copy AS SELECT * FROM $tbl_name LIMIT 0",
+        )
         DBInterface.execute(con, "ALTER TABLE $tbl_copy ADD COLUMN rep_period INTEGER")
         for rp in 1:number_of_rep_periods
             DBInterface.execute(con, "INSERT INTO $tbl_copy SELECT *, $rp FROM $tbl_name")
@@ -303,6 +306,7 @@ function get_default_values(; default_year::Int = 2050)
         :specification => "'uniform'",
         :storage_inflows => 0,
         :storage_method_energy => false,
+        :storage_loss_from_stored_energy => 0.0,
         :technical_lifetime => 1.0,
         :unit_commitment => false,
         :unit_commitment_integer => false,
@@ -316,6 +320,7 @@ function get_default_values(; default_year::Int = 2050)
         :lat => 0,
         :lon => 0,
         :length => 8760,
+        :flow_coefficient_in_capacity_constraint => 1.0,
     )
 end
 

@@ -1,15 +1,14 @@
 # Define the path to the input files
-input_profiles_file = joinpath(@__DIR__, "..", user_input_dir, "profiles.csv")
+input_profiles_file = joinpath(user_input_dir, "profiles", "profiles.csv")
 input_min_max_reservoir_profiles_file =
-    joinpath(@__DIR__, "..", user_input_dir, "min-max-reservoir-levels.csv")
+    joinpath(user_input_dir, "profiles", "min-max-reservoir-levels.csv")
 
 # Define the path to the output files
-output_profiles_file = joinpath(@__DIR__, "..", tulipa_files_dir, "profiles-rep-periods.csv")
-output_mapping_file = joinpath(@__DIR__, "..", tulipa_files_dir, "rep-periods-mapping.csv")
-output_rp_file = joinpath(@__DIR__, "..", tulipa_files_dir, "rep-periods-data.csv")
-output_timeframe_profiles_file =
-    joinpath(@__DIR__, "..", tulipa_files_dir, "profiles-timeframe.csv")
-output_timeframe_data_file = joinpath(@__DIR__, "..", tulipa_files_dir, "timeframe-data.csv")
+output_profiles_file = joinpath(tulipa_files_dir, "profiles-rep-periods.csv")
+output_mapping_file = joinpath(tulipa_files_dir, "rep-periods-mapping.csv")
+output_rp_file = joinpath(tulipa_files_dir, "rep-periods-data.csv")
+output_timeframe_profiles_file = joinpath(tulipa_files_dir, "profiles-timeframe.csv")
+output_timeframe_data_file = joinpath(tulipa_files_dir, "timeframe-data.csv")
 
 # Read the input profiles
 profiles_wide_format = CSV.read(input_profiles_file, DataFrame)
@@ -24,25 +23,33 @@ min_max_reservoir_profiles_long_format =
     stack(min_max_reservoir_profiles, columns; variable_name = :profile_name, value_name = :value)
 
 # If n_rp = 1 (full-year optimization) then append the min-max reservoir profiles to the profiles
-if n_rp == 1
+if clustering_params.n_rp == 1
     profiles_long_format = vcat(profiles_long_format, min_max_reservoir_profiles_long_format)
 end
 
+@show names(profiles_long_format)
+@show size(profiles_long_format)
 # Run TulipaClustering
-TulipaClustering.split_into_periods!(profiles_long_format; period_duration)
-clustering_result =
-    TulipaClustering.find_representative_periods(profiles_long_format, n_rp; method, distance)
+TulipaClustering.split_into_periods!(profiles_long_format; clustering_params.period_duration)
+clustering_result = TulipaClustering.find_representative_periods(
+    profiles_long_format,
+    clustering_params.n_rp;
+    clustering_params.method,
+    clustering_params.distance,
+)
 TulipaClustering.fit_rep_period_weights!(
     clustering_result;
-    weight_type,
-    tol,
-    niters,
-    learning_rate,
-    adaptive_grad,
+    clustering_params.weight_type,
+    clustering_params.tol,
+    clustering_params.niters,
+    clustering_params.learning_rate,
+    clustering_params.adaptive_grad,
 )
 
 # Save the profiles
 clustered_profiles = clustering_result.profiles
+@show names(clustered_profiles)
+@show size(clustered_profiles)
 clustered_profiles =
     select(clustered_profiles, [:profile_name, :year, :rep_period, :timestep, :value])
 CSV.write(output_profiles_file, clustered_profiles; append = false, writeheader = true)
@@ -73,8 +80,11 @@ timeframe_data =
 CSV.write(output_timeframe_data_file, timeframe_data; append = false, writeheader = true)
 
 # Write extra files for n_rp > 1
-if n_rp > 1
-    TulipaClustering.split_into_periods!(min_max_reservoir_profiles_long_format; period_duration)
+if clustering_params.n_rp > 1
+    TulipaClustering.split_into_periods!(
+        min_max_reservoir_profiles_long_format;
+        clustering_params.period_duration,
+    )
     # groupby profile_name, year, period aggregating the value column with mean
     grouped_min_max_reservoir_profiles_long_format = combine(
         groupby(min_max_reservoir_profiles_long_format, [:profile_name, :year, :period]),
