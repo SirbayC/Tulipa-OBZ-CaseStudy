@@ -2,6 +2,10 @@
 
 Tutorial for the OBZ case study as an example of the full workflow of Tulipa.
 
+!!! warning "Not tested for multi-year"
+    Although we use years in the tutorial below, we haven't tried it on a
+    multi-year case study. Your experience may vary.
+
 We are basing ourselves on the Tulipa [data pipeline/workflow](#TODO).
 To help us navigate this workflow, we'll reproduce the diagram from the link above here.
 For more details on the steps of the workflow, check the original link, or follow the tutorial.
@@ -165,9 +169,10 @@ plot(df.timestep, df.value, lab=profile_name)
 
 ```@example obz
 using Distances: SqEuclidean
+using Random: Random
 
+  ## Data for clustering
 clustering_params = (
-    ## Data for clustering
     n_rp = 3,                         # number of representative periods
     period_duration = div(8760, 365), # hours of the representative period
     method = :k_means,
@@ -181,6 +186,7 @@ clustering_params = (
     adaptive_grad = false,
 )
 
+Random.seed!(123)
 TulipaClustering.cluster!(
     connection,
     clustering_params.period_duration,
@@ -195,26 +201,46 @@ TulipaClustering.cluster!(
 )
 ```
 
+These are the tables created by TulipaClustering:
+
+```@example obz
+nice_query("SELECT table_name FROM duckdb_tables WHERE table_name LIKE 'cluster_%'")
+```
+
 ## Prepare data for TulipaEnergyModel's format
 
 Now the hard part starts. We need to create several files for Tulipa using our files.
 Again, we remind you that you can create most of these files externally, i.e.,
 you don't have to use DuckDB to join them here.
 
+### Year data
+
+This data is already correct in the case study and contains a single year.
+
+```@example obz
+DuckDB.query(
+    connection,
+    "CREATE TABLE input_year_data AS 
+    FROM raw_year_data
+    ORDER BY year
+    ",
+)
+```
+
 ### Assets
 
-First, let's join all basic assets data. I will use code to generate the list of relevant tables, but you can do it manually too.
+First, let's join all basic assets data. I will use code to generate the list
+of relevant tables, but you can do it manually too.
+
+!!! tip "TODO"
+    There is opportunity to create a convenience function here.
 
 ```@example obz
 table_names = [
     row.table_name
     for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'raw_assets_%_basic_data'")
 ]
-```
 
-Now, we stack all these tables.
-
-```@example obz
 query_string = join(
     ["FROM $t" for t in table_names],
     " UNION BY NAME ",
@@ -353,7 +379,7 @@ DuckDB.query(
         from_asset,
         to_asset,
         year AS commission_year,
-        coalesce(0, efficiency) AS efficiency,
+        coalesce(1, efficiency) AS efficiency,
     FROM t_flow_yearly
     ORDER by from_asset, to_asset
     "
@@ -388,29 +414,212 @@ DuckDB.query(
 )
 ```
 
+### Assets profiles
+
+We join the assets and storage files.
+
 ```@example obz
-1
+DuckDB.query(
+    connection, 
+    "CREATE TABLE input_assets_profiles AS 
+    FROM raw_assets_profiles
+    UNION BY NAME
+    FROM raw_assets_storage_min_max_reservoir_level_profiles
+    ORDER BY asset, commission_year, profile_name
+    ",
+)
 ```
 
 ```@example obz
-# DEBUG
+DuckDB.query(
+    connection, 
+    "CREATE TABLE input_assets_timeframe_profiles AS 
+    FROM raw_assets_storage_min_max_reservoir_level_profiles
+    ORDER BY asset, commission_year, profile_name
+    ",
+)
+```
+
+### Partitions
+
+```@example obz
+DuckDB.query(
+    connection,
+    "CREATE TABLE input_assets_rep_periods_partitions AS
+    SELECT
+        t.name AS asset,
+        t.year,
+        (t.partition)::string AS partition,
+        rep_periods_data.rep_period,
+        'uniform' AS specification,
+    FROM t_asset_yearly AS t
+    LEFT JOIN cluster_rep_periods_data AS rep_periods_data
+        ON t.year = rep_periods_data.year
+    ORDER BY asset, t.year, rep_period
+    ",
+)
+
+DuckDB.query(
+    connection,
+    "CREATE TABLE input_flows_rep_periods_partitions AS
+    SELECT
+        input_flow.from_asset,
+        input_flow.to_asset,
+        t_from.year,
+        t_from.rep_period,
+        'uniform' AS specification,
+        IF(
+            input_flow.is_transport,
+            greatest(t_from.partition, t_to.partition),
+            least(t_from.partition, t_to.partition)
+        ) AS partition,
+    FROM input_flow
+    LEFT JOIN input_assets_rep_periods_partitions AS t_from
+        ON input_flow.from_asset = t_from.asset
+    LEFT JOIN input_assets_rep_periods_partitions AS t_to
+        ON input_flow.to_asset = t_to.asset
+        AND t_from.year = t_to.year
+        AND t_from.rep_period = t_to.rep_period
+    ",
+)
+
+
+DuckDB.query(
+    connection,
+    "CREATE TABLE input_assets_timeframe_partitions AS
+    SELECT
+        input_asset.asset,
+        input_year_data.year,
+        '1' AS partition,
+        'uniform' AS specification,
+    FROM input_asset
+    CROSS JOIN input_year_data
+    WHERE input_asset.is_seasonal
+    ORDER BY asset, year
+    ",
+)
+```
+
+### Timeframe
+
+The `timeframe` profiles are computed with the aggregation over `period`.
+
+```@example obz
+DuckDB.query(
+    connection,
+    "
+    CREATE TABLE input_profiles_timeframe AS
+    WITH t_timeframe_profile_names AS (
+        SELECT DISTINCT profile_name FROM pivot_min_max_reservoir_levels  
+    )
+    SELECT 
+        t_timeframe_profile_names.profile_name,
+        cluster_profiles_rep_periods.year,
+        cluster_rep_periods_mapping.period,
+        AVG(cluster_profiles_rep_periods.value) AS value,
+    FROM t_timeframe_profile_names
+    LEFT JOIN cluster_profiles_rep_periods
+        ON t_timeframe_profile_names.profile_name = cluster_profiles_rep_periods.profile_name
+    LEFT JOIN cluster_rep_periods_mapping
+        ON cluster_profiles_rep_periods.year = cluster_rep_periods_mapping.year
+        AND cluster_profiles_rep_periods.rep_period = cluster_rep_periods_mapping.rep_period
+    GROUP BY 
+        t_timeframe_profile_names.profile_name,
+        cluster_profiles_rep_periods.year,
+        cluster_rep_periods_mapping.period
+    ORDER BY
+        t_timeframe_profile_names.profile_name,
+        cluster_profiles_rep_periods.year,
+        cluster_rep_periods_mapping.period
+    ",
+)
+```
+
+### Populate with defaults
+
+Finally, in many cases, you will need to complete the missing columns with additional information.
+To simplify this process, we created the `populate_with_defaults!` function.
+Please read TulipaEnergyModel's [populate with default section](#TODO) for a complete picture.
+
+```@example obz
 using TulipaEnergyModel: TulipaEnergyModel as TEM
 
+TEM.populate_with_defaults!(connection)
+```
+
+## Create internal tables for the model indices
+
+```@example obz
+energy_problem = TEM.EnergyProblem(connection)
+```
+
+Now we have any more tables, however the `model` itself was not created yet.
+
+```@example obz
+nice_query(
+    "SELECT DISTINCT
+        regexp_extract(table_name, '^[a-z]*_', 0) as prefix,
+        COUNT(*) AS count,
+    FROM duckdb_tables()
+    WHERE prefix IS NOT NULL
+    GROUP BY prefix
+    ORDER BY prefix
+    ",
+)
+```
+
+## Create model
+
+```@example obz
+TEM.create_model!(energy_problem)
+```
+
+## Solve model
+
+Last, but not least important, we solve the model:
+
+```@example obz
+TEM.solve_model!(energy_problem)
+```
+
+## Store primal and dual solution
+
+## Data processing for plots and dashboard
+
+## Create plots
+
+## Export solution
+
+## Debug
+
+```@example obz
+# DEBUG
+schemas = copy(TEM.schema_per_table_name) # expanding the schemas to include expected
+for (table_name, table) in schemas
+    table_name = replace(table_name, "input_" => "expected_")
+    schemas[table_name] = table
+end
 expected_folder = joinpath(@__DIR__, "..", "..", "tulipa-energy-model-files") 
 TulipaIO.read_csv_folder(
     connection, 
-    expected_folder, 
-    schemas = TEM.schema_per_table_name, 
+    expected_folder;
+    schemas,
     table_name_prefix = "expected_",
 )
 nice_query("FROM expected_assets_profiles ORDER BY asset LIMIT 10")
 
 # Copy remaining tables
 copied_over = String[]
+#=
 for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'expected_%'")
     expected_table_name = row.table_name
     table_name = replace(expected_table_name, "expected_" => "")
-    if table_name in ("rep_periods_data", "rep_periods_mapping", "profiles_rep_periods")
+    if table_name in (
+        "rep_periods_data",
+        "rep_periods_mapping",
+        "timeframe_data",
+        "profiles_rep_periods",
+    )
         continue
     end
     input_table_name = "input_" * table_name
@@ -422,40 +631,93 @@ for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'e
         push!(copied_over, table_name)
     end
 end
+=#
 copied_over
 ```
 
-```@example obz
-TEM.populate_with_defaults!(connection)
-```
+### Differences between expected and computed data
 
 ```@example obz
-try
-    energy_problem = TEM.EnergyProblem(connection)
-catch ex
-    @show ex
+for (table_name, primary_keys) in (
+    ("input_asset", (:asset,)),
+    ("input_asset_both", (:asset, :milestone_year, :commission_year)),
+    ("input_asset_commission", (:asset, :commission_year)),
+    ("input_asset_milestone", (:asset, :milestone_year)),
+    ("input_assets_profiles", (:asset, :commission_year, :profile_type)),
+    ("input_assets_rep_periods_partitions", (:asset, :year, :rep_period)),
+    ("input_assets_timeframe_partitions", (:asset, :year)),
+    ("input_assets_timeframe_profiles", (:asset, :commission_year, :profile_type)),
+    ("input_flow", (:from_asset, :to_asset)),
+    ("input_flow_both", (:from_asset, :to_asset, :milestone_year, :commission_year)),
+    ("input_flow_commission", (:from_asset, :to_asset, :commission_year)),
+    ("input_flow_milestone", (:from_asset, :to_asset, :milestone_year)),
+    ("input_flows_profiles", (:from_asset, :to_asset, :year, :profile_type)),
+    ("input_flows_rep_periods_partitions", (:from_asset, :to_asset, :year, :rep_period)),
+    ("input_group_asset", (:name, :milestone_year)),
+    ("cluster_profiles_rep_periods", (:profile_name, :year, :rep_period, :timestep)),
+    ("input_profiles_timeframe", (:profile_name, :year, :period)),
+    ("cluster_rep_periods_data", (:year, :rep_period)),
+    ("cluster_rep_periods_mapping", (:year, :period, :rep_period)),
+    ("cluster_timeframe_data", (:year, :period)),
+    ("input_year_data", (:year,)),
+)
+    expected_table_name = replace(table_name, "input_" => "expected_", "cluster_" => "expected_")
+    join_keys = join(
+        ["$table_name.$k = $expected_table_name.$k" for k in primary_keys],
+        " AND ",
+    )
+
+    if (DuckDB.query(connection, "SELECT COUNT(*) == 0 FROM duckdb_tables WHERE table_name = '$expected_table_name'") |> first |> first)
+        continue
+    end
+
+    t = replace(expected_table_name, "expected_" => "")
+    num = DuckDB.query(
+        connection,
+        "CREATE TABLE diff_$t AS
+        SELECT 'computed' AS origin, $table_name.*
+        FROM $table_name ANTI JOIN $expected_table_name ON $join_keys
+        UNION BY NAME
+        SELECT 'expected' AS origin, $expected_table_name.*
+        FROM $expected_table_name ANTI JOIN $table_name ON $join_keys
+    ") |> first |> first
+    if num > 0
+        @show table_name num
+    end
 end
-# nice_query("SHOW TABLES")
+```
+
+# TODO LIST ^
+
+```@example obz
+sample(t, n = 7) = nice_query("FROM $t ORDER BY random() LIMIT $n")
+sample("diff_assets_timeframe_profiles")
 ```
 
 ```@example obz
-# TEM.create_model!(energy_problem)
-nice_query("from input_assets_rep_periods_partitions LIMIT 10")
+sample("diff_assets_profiles")
 ```
 
-## Create internal tables for the model indices
+```@example obz
+sample("diff_profiles_rep_periods", 15)
+```
 
-## Create model
+```@example obz
+sample("diff_rep_periods_mapping")
+```
 
-## Solve model
-
-## Store primal and dual solution
-
-## Data processing for plots and dashboard
-
-## Create plots
-
-## Export solution
+```@example obz
+nice_query("
+    FROM var_flow 
+    WHERE from_asset='AT_Battery' 
+        AND to_asset='AT_E_Balance' 
+        AND year=2050 
+        AND rep_period=1 
+    ORDER BY random() 
+    LIMIT 5
+")
+nothing
+```
 
 ## [TODO](@id TODO)
 
