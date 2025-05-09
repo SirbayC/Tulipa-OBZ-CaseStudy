@@ -68,14 +68,12 @@ using TulipaIO: TulipaIO
 TulipaIO.read_csv_folder(
     connection, 
     user_input_dir,
-    table_name_prefix = "raw_", 
     replace_if_exists = true,
     skip = 1, # Data in this folder has an extra header line
 )
 TulipaIO.read_csv_folder(
     connection, 
     joinpath(user_input_dir, "profiles"), 
-    table_name_prefix = "raw_", 
     replace_if_exists = true,
 )
 
@@ -100,21 +98,21 @@ We need a single profiles table with 4 columns:
 And we have 2 profiles tables:
 
 ```@example obz
-nice_query("FROM raw_profiles LIMIT 10")
+nice_query("FROM profiles LIMIT 10")
 ```
 
 ```@example obz
-nice_query("FROM raw_min_max_reservoir_levels LIMIT 10")
+nice_query("FROM min_max_reservoir_levels LIMIT 10")
 ```
 
 Notice that these are all hourly profiles for the whole year:
 
 ```@example obz
-nice_query("SELECT year, MAX(timestep) FROM raw_profiles GROUP BY year")
+nice_query("SELECT year, MAX(timestep) FROM profiles GROUP BY year")
 ```
 
 ```@example obz
-nice_query("SELECT year, MAX(timestep) FROM raw_min_max_reservoir_levels GROUP BY year")
+nice_query("SELECT year, MAX(timestep) FROM min_max_reservoir_levels GROUP BY year")
 ```
 
 So we will transform both these tables to long format and stack them:
@@ -122,12 +120,13 @@ So we will transform both these tables to long format and stack them:
 ```@example obz
 using TulipaClustering: TulipaClustering 
 
-TulipaClustering.transform_wide_to_long!(connection, "raw_profiles", "pivot_profiles")
-TulipaClustering.transform_wide_to_long!(connection, "raw_min_max_reservoir_levels", "pivot_min_max_reservoir_levels")
+TulipaClustering.transform_wide_to_long!(connection, "profiles", "pivot_profiles")
+TulipaClustering.transform_wide_to_long!(connection, "min_max_reservoir_levels", "pivot_min_max_reservoir_levels")
 
+DuckDB.query(connection, "CREATE SCHEMA IF NOT EXISTS input")
 DuckDB.query(
     connection,
-    "CREATE OR REPLACE TABLE input_profiles AS
+    "CREATE OR REPLACE TABLE input.profiles AS
     FROM pivot_profiles
     UNION
     FROM pivot_min_max_reservoir_levels
@@ -135,7 +134,7 @@ DuckDB.query(
     "
 )
 
-nice_query("SELECT COUNT(*) FROM input_profiles")
+nice_query("SELECT COUNT(*) FROM input.profiles")
 ```
 
 The expected number of rows is
@@ -156,7 +155,7 @@ year = 2050
 # it's cheaper to not do it.
 subtable = DuckDB.query(
     connection, 
-    "SELECT timestep, value FROM input_profiles 
+    "SELECT timestep, value FROM input.profiles 
     WHERE profile_name='$profile_name' AND year=$year
     ORDER BY timestep
     ",
@@ -204,7 +203,7 @@ TulipaClustering.cluster!(
 These are the tables created by TulipaClustering:
 
 ```@example obz
-nice_query("SELECT table_name FROM duckdb_tables WHERE table_name LIKE 'cluster_%'")
+nice_query("SELECT table_name FROM duckdb_tables WHERE table_name LIKE 'cluster.%'")
 ```
 
 ## Prepare data for TulipaEnergyModel's format
@@ -220,8 +219,8 @@ This data is already correct in the case study and contains a single year.
 ```@example obz
 DuckDB.query(
     connection,
-    "CREATE TABLE input_year_data AS 
-    FROM raw_year_data
+    "CREATE TABLE input.year_data AS 
+    FROM year_data
     ORDER BY year
     ",
 )
@@ -238,7 +237,7 @@ of relevant tables, but you can do it manually too.
 ```@example obz
 table_names = [
     row.table_name
-    for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'raw_assets_%_basic_data'")
+    for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'assets_%_basic_data'")
 ]
 
 query_string = join(
@@ -247,7 +246,7 @@ query_string = join(
 )
 DuckDB.query(
     connection, 
-    "CREATE TABLE input_asset AS 
+    "CREATE TABLE input.asset AS 
     SELECT
         name AS asset,
         type,
@@ -259,15 +258,15 @@ DuckDB.query(
     ",
 )
 
-nice_query("FROM input_asset ORDER BY random() LIMIT 10")
+nice_query("FROM input.asset ORDER BY random() LIMIT 10")
 ```
 
-Similarly, we join the `raw_assets_%_yearly_data` tables:
+Similarly, we join the `assets_%_yearly_data` tables:
 
 ```@example obz
 table_names = [
     row.table_name
-    for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'raw_assets_%_yearly_data'")
+    for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'assets_%_yearly_data'")
 ]
 
 query_string = join(
@@ -290,7 +289,7 @@ This `t_asset_yearly` tables is used to create three other asset tables.
 ```@example obz
 DuckDB.query(
     connection,
-    "CREATE TABLE input_asset_commission AS 
+    "CREATE TABLE input.asset_commission AS 
     SELECT
         name AS asset,
         year AS commission_year,
@@ -301,7 +300,7 @@ DuckDB.query(
 
 DuckDB.query(
     connection,
-    "CREATE TABLE input_asset_milestone AS 
+    "CREATE TABLE input.asset_milestone AS 
     SELECT
         name AS asset,
         year AS milestone_year,
@@ -315,7 +314,7 @@ DuckDB.query(
 
 DuckDB.query(
     connection,
-    "CREATE TABLE input_asset_both AS 
+    "CREATE TABLE input.asset_both AS 
     SELECT
         name AS asset,
         year AS milestone_year,
@@ -335,7 +334,7 @@ We repeat the steps above for flows:
 ```@example obz
 table_names = [
     row.table_name
-    for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'raw_flows_%_basic_data'")
+    for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'flows_%_basic_data'")
 ]
 query_string = join(
     ["FROM $t" for t in table_names],
@@ -343,7 +342,7 @@ query_string = join(
 )
 DuckDB.query(
     connection, 
-    "CREATE TABLE input_flow AS 
+    "CREATE TABLE input.flow AS 
     SELECT
         from_asset,
         to_asset,
@@ -357,7 +356,7 @@ DuckDB.query(
 
 table_names = [
     row.table_name
-    for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'raw_flows_%_yearly_data'")
+    for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'flows_%_yearly_data'")
 ]
 
 query_string = join(
@@ -374,7 +373,7 @@ DuckDB.query(
 
 DuckDB.query(
     connection,
-    "CREATE TABLE input_flow_commission AS 
+    "CREATE TABLE input.flow_commission AS 
     SELECT
         from_asset,
         to_asset,
@@ -387,7 +386,7 @@ DuckDB.query(
 
 DuckDB.query(
     connection,
-    "CREATE TABLE input_flow_milestone AS 
+    "CREATE TABLE input.flow_milestone AS 
     SELECT
         from_asset, 
         to_asset,
@@ -400,7 +399,7 @@ DuckDB.query(
 
 DuckDB.query(
     connection,
-    "CREATE TABLE input_flow_both AS 
+    "CREATE TABLE input.flow_both AS 
     SELECT
         from_asset, 
         to_asset,
@@ -421,10 +420,10 @@ We join the assets and storage files.
 ```@example obz
 DuckDB.query(
     connection, 
-    "CREATE TABLE input_assets_profiles AS 
-    FROM raw_assets_profiles
+    "CREATE TABLE input.assets_profiles AS 
+    FROM assets_profiles
     UNION BY NAME
-    FROM raw_assets_storage_min_max_reservoir_level_profiles
+    FROM assets_storage_min_max_reservoir_level_profiles
     ORDER BY asset, commission_year, profile_name
     ",
 )
@@ -433,8 +432,8 @@ DuckDB.query(
 ```@example obz
 DuckDB.query(
     connection, 
-    "CREATE TABLE input_assets_timeframe_profiles AS 
-    FROM raw_assets_storage_min_max_reservoir_level_profiles
+    "CREATE TABLE input.assets_timeframe_profiles AS 
+    FROM assets_storage_min_max_reservoir_level_profiles
     ORDER BY asset, commission_year, profile_name
     ",
 )
@@ -445,7 +444,7 @@ DuckDB.query(
 ```@example obz
 DuckDB.query(
     connection,
-    "CREATE TABLE input_assets_rep_periods_partitions AS
+    "CREATE TABLE input.assets_rep_periods_partitions AS
     SELECT
         t.name AS asset,
         t.year,
@@ -453,7 +452,7 @@ DuckDB.query(
         rep_periods_data.rep_period,
         'uniform' AS specification,
     FROM t_asset_yearly AS t
-    LEFT JOIN cluster_rep_periods_data AS rep_periods_data
+    LEFT JOIN cluster.rep_periods_data AS rep_periods_data
         ON t.year = rep_periods_data.year
     ORDER BY asset, t.year, rep_period
     ",
@@ -461,23 +460,23 @@ DuckDB.query(
 
 DuckDB.query(
     connection,
-    "CREATE TABLE input_flows_rep_periods_partitions AS
+    "CREATE TABLE input.flows_rep_periods_partitions AS
     SELECT
-        input_flow.from_asset,
-        input_flow.to_asset,
+        input.flow.from_asset,
+        input.flow.to_asset,
         t_from.year,
         t_from.rep_period,
         'uniform' AS specification,
         IF(
-            input_flow.is_transport,
+            input.flow.is_transport,
             greatest(t_from.partition, t_to.partition),
             least(t_from.partition, t_to.partition)
         ) AS partition,
-    FROM input_flow
-    LEFT JOIN input_assets_rep_periods_partitions AS t_from
-        ON input_flow.from_asset = t_from.asset
-    LEFT JOIN input_assets_rep_periods_partitions AS t_to
-        ON input_flow.to_asset = t_to.asset
+    FROM input.flow
+    LEFT JOIN input.assets_rep_periods_partitions AS t_from
+        ON input.flow.from_asset = t_from.asset
+    LEFT JOIN input.assets_rep_periods_partitions AS t_to
+        ON input.flow.to_asset = t_to.asset
         AND t_from.year = t_to.year
         AND t_from.rep_period = t_to.rep_period
     ",
@@ -486,15 +485,15 @@ DuckDB.query(
 
 DuckDB.query(
     connection,
-    "CREATE TABLE input_assets_timeframe_partitions AS
+    "CREATE TABLE input.assets_timeframe_partitions AS
     SELECT
-        input_asset.asset,
-        input_year_data.year,
+        input.asset.asset,
+        input.year_data.year,
         '1' AS partition,
         'uniform' AS specification,
-    FROM input_asset
-    CROSS JOIN input_year_data
-    WHERE input_asset.is_seasonal
+    FROM input.asset
+    CROSS JOIN input.year_data
+    WHERE input.asset.is_seasonal
     ORDER BY asset, year
     ",
 )
@@ -508,29 +507,29 @@ The `timeframe` profiles are computed with the aggregation over `period`.
 DuckDB.query(
     connection,
     "
-    CREATE TABLE input_profiles_timeframe AS
+    CREATE TABLE input.profiles_timeframe AS
     WITH t_timeframe_profile_names AS (
         SELECT DISTINCT profile_name FROM pivot_min_max_reservoir_levels  
     )
     SELECT 
         t_timeframe_profile_names.profile_name,
-        cluster_profiles_rep_periods.year,
-        cluster_rep_periods_mapping.period,
-        AVG(cluster_profiles_rep_periods.value) AS value,
+        cluster.profiles_rep_periods.year,
+        cluster.rep_periods_mapping.period,
+        AVG(cluster.profiles_rep_periods.value) AS value,
     FROM t_timeframe_profile_names
-    LEFT JOIN cluster_profiles_rep_periods
-        ON t_timeframe_profile_names.profile_name = cluster_profiles_rep_periods.profile_name
-    LEFT JOIN cluster_rep_periods_mapping
-        ON cluster_profiles_rep_periods.year = cluster_rep_periods_mapping.year
-        AND cluster_profiles_rep_periods.rep_period = cluster_rep_periods_mapping.rep_period
+    LEFT JOIN cluster.profiles_rep_periods
+        ON t_timeframe_profile_names.profile_name = cluster.profiles_rep_periods.profile_name
+    LEFT JOIN cluster.rep_periods_mapping
+        ON cluster.profiles_rep_periods.year = cluster.rep_periods_mapping.year
+        AND cluster.profiles_rep_periods.rep_period = cluster.rep_periods_mapping.rep_period
     GROUP BY 
         t_timeframe_profile_names.profile_name,
-        cluster_profiles_rep_periods.year,
-        cluster_rep_periods_mapping.period
+        cluster.profiles_rep_periods.year,
+        cluster.rep_periods_mapping.period
     ORDER BY
         t_timeframe_profile_names.profile_name,
-        cluster_profiles_rep_periods.year,
-        cluster_rep_periods_mapping.period
+        cluster.profiles_rep_periods.year,
+        cluster.rep_periods_mapping.period
     ",
 )
 ```
@@ -594,23 +593,19 @@ TEM.solve_model!(energy_problem)
 
 ```@example obz
 # DEBUG
-schemas = copy(TEM.schema_per_table_name) # expanding the schemas to include expected
-for (table_name, table) in schemas
-    table_name = replace(table_name, "input_" => "expected_")
-    schemas[table_name] = table
-end
+#=
 expected_folder = joinpath(@__DIR__, "..", "..", "tulipa-energy-model-files") 
 TulipaIO.read_csv_folder(
     connection, 
     expected_folder;
-    schemas,
+    schemas = TEM.sql_input_schema_per_table_name,
     table_name_prefix = "expected_",
 )
 nice_query("FROM expected_assets_profiles ORDER BY asset LIMIT 10")
 
 # Copy remaining tables
 copied_over = String[]
-#=
+
 for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'expected_%'")
     expected_table_name = row.table_name
     table_name = replace(expected_table_name, "expected_" => "")
@@ -622,48 +617,50 @@ for row in DuckDB.query(connection, "FROM duckdb_tables WHERE table_name LIKE 'e
     )
         continue
     end
-    input_table_name = "input_" * table_name
+    input.table_name = "input." * table_name
     exitflag = DuckDB.query(
         connection, 
-        "CREATE TABLE IF NOT EXISTS $input_table_name AS FROM $expected_table_name",
+        "CREATE TABLE IF NOT EXISTS $input.table_name AS FROM $expected_table_name",
     )
     if length(collect(exitflag)) > 0
         push!(copied_over, table_name)
     end
 end
-=#
 copied_over
+=# 
+"Does not work anymore"
 ```
 
 ### Differences between expected and computed data
 
 ```@example obz
+#=
 for (table_name, primary_keys) in (
-    ("input_asset", (:asset,)),
-    ("input_asset_both", (:asset, :milestone_year, :commission_year)),
-    ("input_asset_commission", (:asset, :commission_year)),
-    ("input_asset_milestone", (:asset, :milestone_year)),
-    ("input_assets_profiles", (:asset, :commission_year, :profile_type)),
-    ("input_assets_rep_periods_partitions", (:asset, :year, :rep_period)),
-    ("input_assets_timeframe_partitions", (:asset, :year)),
-    ("input_assets_timeframe_profiles", (:asset, :commission_year, :profile_type)),
-    ("input_flow", (:from_asset, :to_asset)),
-    ("input_flow_both", (:from_asset, :to_asset, :milestone_year, :commission_year)),
-    ("input_flow_commission", (:from_asset, :to_asset, :commission_year)),
-    ("input_flow_milestone", (:from_asset, :to_asset, :milestone_year)),
-    ("input_flows_profiles", (:from_asset, :to_asset, :year, :profile_type)),
-    ("input_flows_rep_periods_partitions", (:from_asset, :to_asset, :year, :rep_period)),
-    ("input_group_asset", (:name, :milestone_year)),
-    ("cluster_profiles_rep_periods", (:profile_name, :year, :rep_period, :timestep)),
-    ("input_profiles_timeframe", (:profile_name, :year, :period)),
-    ("cluster_rep_periods_data", (:year, :rep_period)),
-    ("cluster_rep_periods_mapping", (:year, :period, :rep_period)),
-    ("cluster_timeframe_data", (:year, :period)),
-    ("input_year_data", (:year,)),
+    ("input.asset", (:asset,)),
+    ("input.asset_both", (:asset, :milestone_year, :commission_year)),
+    ("input.asset_commission", (:asset, :commission_year)),
+    ("input.asset_milestone", (:asset, :milestone_year)),
+    ("input.assets_profiles", (:asset, :commission_year, :profile_type)),
+    ("input.assets_rep_periods_partitions", (:asset, :year, :rep_period)),
+    ("input.assets_timeframe_partitions", (:asset, :year)),
+    ("input.assets_timeframe_profiles", (:asset, :commission_year, :profile_type)),
+    ("input.flow", (:from_asset, :to_asset)),
+    ("input.flow_both", (:from_asset, :to_asset, :milestone_year, :commission_year)),
+    ("input.flow_commission", (:from_asset, :to_asset, :commission_year)),
+    ("input.flow_milestone", (:from_asset, :to_asset, :milestone_year)),
+    ("input.flows_profiles", (:from_asset, :to_asset, :year, :profile_type)),
+    ("input.flows_rep_periods_partitions", (:from_asset, :to_asset, :year, :rep_period)),
+    ("input.group_asset", (:name, :milestone_year)),
+    ("cluster.profiles_rep_periods", (:profile_name, :year, :rep_period, :timestep)),
+    ("input.profiles_timeframe", (:profile_name, :year, :period)),
+    ("cluster.rep_periods_data", (:year, :rep_period)),
+    ("cluster.rep_periods_mapping", (:year, :period, :rep_period)),
+    ("cluster.timeframe_data", (:year, :period)),
+    ("input.year_data", (:year,)),
 )
-    expected_table_name = replace(table_name, "input_" => "expected_", "cluster_" => "expected_")
+    expected_table_name = replace(table_name, "input." => "expected_", "cluster." => "expected_")
     join_keys = join(
-        ["$table_name.$k = $expected_table_name.$k" for k in primary_keys],
+        ["t.$k = $expected_table_name.$k" for k in primary_keys],
         " AND ",
     )
 
@@ -676,39 +673,32 @@ for (table_name, primary_keys) in (
         connection,
         "CREATE TABLE diff_$t AS
         SELECT 'computed' AS origin, $table_name.*
-        FROM $table_name ANTI JOIN $expected_table_name ON $join_keys
+        FROM $table_name AS t ANTI JOIN $expected_table_name ON $join_keys
         UNION BY NAME
         SELECT 'expected' AS origin, $expected_table_name.*
-        FROM $expected_table_name ANTI JOIN $table_name ON $join_keys
+        FROM $expected_table_name ANTI JOIN $table_name AS t ON $join_keys
     ") |> first |> first
     if num > 0
         @show table_name num
     end
 end
+=#
+"Does not work anymore"
 ```
 
 # TODO LIST ^
 
 ```@example obz
+#=
 sample(t, n = 7) = nice_query("FROM $t ORDER BY random() LIMIT $n")
-sample("diff_assets_timeframe_profiles")
-```
-
-```@example obz
-sample("diff_assets_profiles")
-```
-
-```@example obz
 sample("diff_profiles_rep_periods", 15)
-```
-
-```@example obz
-sample("diff_rep_periods_mapping")
+=#
+"Does not work anymore"
 ```
 
 ```@example obz
 nice_query("
-    FROM var_flow 
+    FROM variables.flow 
     WHERE from_asset='AT_Battery' 
         AND to_asset='AT_E_Balance' 
         AND year=2050 
