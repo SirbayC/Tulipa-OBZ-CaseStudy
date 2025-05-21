@@ -365,15 +365,15 @@ Generate a DataFrame containing prices for hubs and consumers over time.
 - `DataFrame`: A DataFrame with columns `:asset`, `:year`, `:rep_period`, `:time`, and `:price`, representing the electricity prices for hubs over time.
 
 """
-function get_prices_dataframe(connection, energy_problem::EnergyProblem)
-    df_hubs = _process_prices(connection, "cons_balance_hub", :dual_balance_hub, energy_problem)
+function get_prices_dataframe(connection)
+    df_hubs = _process_prices(connection, "cons_balance_hub", :dual_balance_hub)
     df_consumer =
-        _process_prices(connection, "cons_balance_consumer", :dual_balance_consumer, energy_problem)
+        _process_prices(connection, "cons_balance_consumer", :dual_balance_consumer)
     df_prices = vcat(df_hubs, df_consumer; cols = :union)
     return df_prices
 end
 
-function _process_prices(connection, table_name, duals_key, energy_problem)
+function _process_prices(connection, table_name, duals_key)
     # Get the representative periods resolution
     _df = DuckDB.query(
         connection,
