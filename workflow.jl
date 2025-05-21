@@ -32,10 +32,12 @@ output_dir = "outputs"
 ## Create the directories for tulipa files and outputs
 if !isdir(joinpath(@__DIR__, tulipa_files_dir))
     mkdir(joinpath(@__DIR__, tulipa_files_dir))
-else
-    rm(joinpath(@__DIR__, tulipa_files_dir); force = true, recursive = true)
-    mkdir(joinpath(@__DIR__, tulipa_files_dir))
+# else
+#     rm(joinpath(@__DIR__, tulipa_files_dir); force = true, recursive = true)
+#     mkdir(joinpath(@__DIR__, tulipa_files_dir))
 end
+rm(joinpath(@__DIR__, tulipa_files_dir, "flows-rep-periods-partitions.csv"))
+
 if !isdir(joinpath(@__DIR__, output_dir))
     mkdir(joinpath(@__DIR__, output_dir))
 end
@@ -57,20 +59,22 @@ niters = 100
 learning_rate = 0.001
 adaptive_grad = false
 
-@info "Pre-processing the profiles"
-include("utils/preprocess-profiles.jl")
+# @info "Pre-processing the profiles"
+# include("utils/preprocess-profiles.jl")
 
 @info "Pre-processing the user inputs"
 include("utils/preprocess-user-inputs.jl")
 
-@info "Setting up the solver"
-optimizer = HiGHS.Optimizer
-parameters = Dict("output_flag" => true, "mip_rel_gap" => 0.0, "mip_feasibility_tolerance" => 1e-5)
+# @info "Setting up the solver"
+# optimizer = HiGHS.Optimizer
+# parameters = Dict("output_flag" => true, "mip_rel_gap" => 0.0, "mip_feasibility_tolerance" => 1e-5)
 
 # using Gurobi
 # optimizer = Gurobi.Optimizer
 # parameters = Dict("OutputFlag" => 1, "MIPGap" => 0.0, "FeasibilityTol" => 1e-5)
 
+# [Cosmin] So for some reason, this really wants to work with a NEWLY created flows-rep-periods-partitions,
+# otherwise it fails....
 @info "Reading Tulipa input files"
 connection = DBInterface.connect(DuckDB.DB)
 read_csv_folder(
@@ -79,24 +83,24 @@ read_csv_folder(
     schemas = TulipaEnergyModel.schema_per_table_name,
 )
 
-@info "Solving the optimization problem"
-energy_problem = run_scenario(
-    connection;
-    output_folder = joinpath(@__DIR__, output_dir),
-    optimizer = optimizer,
-    parameters = parameters,
-    #model_file_name = "model.lp",
-    show_log = true,
-    log_file = "log_file.log",
-    #enable_names = false,
-)
+# @info "Solving the optimization problem"
+# energy_problem = run_scenario(
+#     connection;
+#     output_folder = joinpath(@__DIR__, output_dir),
+#     optimizer = optimizer,
+#     parameters = parameters,
+#     #model_file_name = "model.lp",
+#     show_log = true,
+#     log_file = "log_file.log",
+#     #enable_names = false,
+# )
 
-if energy_problem.termination_status == INFEASIBLE
-    @info "Getting the IIS model to find infeasibilities"
-    compute_conflict!(energy_problem.model)
-    iis_model, reference_map = copy_conflict(energy_problem.model)
-    print(iis_model)
-end
+# if energy_problem.termination_status == INFEASIBLE
+#     @info "Getting the IIS model to find infeasibilities"
+#     compute_conflict!(energy_problem.model)
+#     iis_model, reference_map = copy_conflict(energy_problem.model)
+#     print(iis_model)
+# end
 
 @info "Creating auxiliary file to post-process the results"
 assets_bidding_zone_tecnology_file = "assets-bidding-zone-tecnology-data.csv"
@@ -108,13 +112,14 @@ df_assets_basic_data = create_one_file_for_assets_basic_info(
 )
 
 @info "Post-processig of prices"
-prices = get_prices_dataframe(connection, energy_problem)
+prices = get_prices_dataframe(connection)
 
 @info "Post-processig of storage levels"
 intra_storage_levels = get_intra_storage_levels_dataframe(connection)
 
-@info "Post-processig of balance per balancing asset"
-balances = get_balance_per_asset(connection, energy_problem, df_assets_basic_data)
+# [Cosmin] This actually uses a table from energy_problem, why???
+# @info "Post-processig of balance per balancing asset"
+# balances = get_balance_per_asset(connection, energy_problem, df_assets_basic_data)
 
 @info "Saving the results to CSV files"
 prices_file_name = joinpath(@__DIR__, output_dir, "eu-case-prices.csv")
@@ -123,14 +128,14 @@ CSV.write(prices_file_name, unstack(prices, :asset, :price))
 intra_storage_levels_file_name = joinpath(@__DIR__, output_dir, "eu-case-intra-storage-levels.csv")
 CSV.write(intra_storage_levels_file_name, unstack(intra_storage_levels, :asset, :SoC))
 
-balance_file_name = joinpath(@__DIR__, output_dir, "eu-case-balance-per-bidding-zone.csv")
-CSV.write(balance_file_name, unstack(balances, :technology, :solution; fill = 0))
+# balance_file_name = joinpath(@__DIR__, output_dir, "eu-case-balance-per-bidding-zone.csv")
+# CSV.write(balance_file_name, unstack(balances, :technology, :solution; fill = 0))
 
 @info "Plotting the results"
 prices_plot = plot_prices(
     prices;
-    assets = ["NL_E_Balance", "UK_E_Balance", "OBZLL_E_Balance"],
-    #rep_periods = [1, 2],
+    assets = ["NL_E_Balance"],
+    rep_periods = [1, 2],
     #plots_args = (xlims = (8760 / 2, 8760 / 2 + 168), ylims = (0, 100)),
     plots_args = (xticks = 0:730:8760, ylim = (0, 100)),
     duration_curve = true,
@@ -165,28 +170,28 @@ end
 hydro_storage_levels_plot_name = joinpath(@__DIR__, output_dir, "eu-case-hydro-storage-levels.png")
 savefig(hydro_storage_levels_plot, hydro_storage_levels_plot_name)
 
-asset = "NL_E_Balance" # Any hub or consumer is a valid assets
-balance_plot = plot_asset_balance(
-    balances;
-    asset = asset,
-    year = 2050,
-    rep_period = 1,
-    plots_args = (xlims = (8760 / 2, 8760 / 2 + 168), xticks = 0:6:8760),
-)
-balance_plot_name = joinpath(@__DIR__, output_dir, "eu-case-balance-$asset.png")
-savefig(balance_plot, balance_plot_name)
+# asset = "NL_E_Balance" # Any hub or consumer is a valid assets
+# balance_plot = plot_asset_balance(
+#     balances;
+#     asset = asset,
+#     year = 2050,
+#     rep_period = 1,
+#     plots_args = (xlims = (8760 / 2, 8760 / 2 + 168), xticks = 0:6:8760),
+# )
+# balance_plot_name = joinpath(@__DIR__, output_dir, "eu-case-balance-$asset.png")
+# savefig(balance_plot, balance_plot_name)
 
-from_asset = "OBZLL_E_Balance"
-to_asset = "NL_E_Balance"
-year = 2050
-rep_period = 1
-flow_plot = plot_flow(
-    connection,
-    from_asset,
-    to_asset,
-    year,
-    rep_period;
-    plots_args = (xlims = (8760 / 2, 8760 / 2 + 168), xticks = 0:12:8760),
-)
-flow_plot_name = joinpath(@__DIR__, output_dir, "flows-$from_asset-$to_asset.png")
-savefig(flow_plot, flow_plot_name)
+# from_asset = "OBZLL_E_Balance"
+# to_asset = "NL_E_Balance"
+# year = 2050
+# rep_period = 1
+# flow_plot = plot_flow(
+#     connection,
+#     from_asset,
+#     to_asset,
+#     year,
+#     rep_period;
+#     plots_args = (xlims = (8760 / 2, 8760 / 2 + 168), xticks = 0:12:8760),
+# )
+# flow_plot_name = joinpath(@__DIR__, output_dir, "flows-$from_asset-$to_asset.png")
+# savefig(flow_plot, flow_plot_name)

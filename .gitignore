@@ -29,4 +29,7 @@ test-files*
 *.log
 *.lp
 debugging*
-tulipa-energy-model-files*
+# tulipa-energy-model-files* [Cosmin] I actually use this insteaad of user inputs
+
+.vscode
+.idea
